@@ -6,6 +6,8 @@ Key Changes:
 2. Each product-task combination is a unique schedulable entity
 3. Task IDs are now formatted as "PRODUCT_TASKNUM" (e.g., "A_80", "E_25")
 4. Dependencies, late parts, and rework are product-specific
+5. FIXED: Finish <= Finish constraint handling
+6. FIXED: Late parts delay logic
 
 Original functionality maintained:
 - All three scenarios (CSV capacity, minimize makespan, multi-dimensional optimization)
@@ -301,6 +303,10 @@ class ProductionScheduler:
                                 'Relationship': relationship,
                                 'Product': product
                             })
+
+                            # Debug F<=F constraints
+                            if relationship == 'Finish <= Finish' and self.debug:
+                                print(f"[DEBUG] F<=F constraint: {first_id} must finish before/at {second_id}")
 
             print(f"[DEBUG] Created {len(self.precedence_constraints)} product-specific precedence constraints")
 
@@ -912,10 +918,33 @@ class ProductionScheduler:
         # Set to start of workday (6 AM)
         earliest_start = earliest_start.replace(hour=6, minute=0, second=0, microsecond=0)
 
+        if self.debug:
+            print(f"[DEBUG] Late part {task_id}:")
+            print(f"  On-dock date: {on_dock_date}")
+            print(f"  Delay days: {self.late_part_delay_days}")
+            print(f"  Earliest start: {earliest_start}")
+
         return earliest_start
 
+    def apply_late_part_delay_to_dependent(self, late_part_id, dependent_task_id):
+        """Apply late part delay to the dependent task"""
+        if late_part_id not in self.on_dock_dates:
+            return None
+
+        on_dock_date = self.on_dock_dates[late_part_id]
+        dependent_earliest_start = on_dock_date + timedelta(days=self.late_part_delay_days)
+
+        if self.debug:
+            print(f"[DEBUG] Late part dependency:")
+            print(f"  Late part: {late_part_id}")
+            print(f"  On-dock: {on_dock_date}")
+            print(f"  Dependent task: {dependent_task_id}")
+            print(f"  Dependent cannot start before: {dependent_earliest_start}")
+
+        return dependent_earliest_start
+
     def schedule_tasks(self, allow_late_delivery=False, silent_mode=False):
-        """Enhanced scheduling algorithm with capacity awareness and product-task instances"""
+        """Enhanced scheduling algorithm with proper F<=F constraint handling"""
         # Save original debug setting
         original_debug = self.debug
         if silent_mode:
@@ -939,13 +968,28 @@ class ProductionScheduler:
         dependencies = defaultdict(set)
         dependents = defaultdict(set)
 
+        # Track F<=F constraints separately for special handling
+        finish_finish_constraints = {}
+
         for constraint in dynamic_constraints:
-            if constraint['Relationship'] in ['Finish <= Start', 'Finish = Start']:
-                dependencies[constraint['Second']].add(constraint['First'])
-                dependents[constraint['First']].add(constraint['Second'])
-            elif constraint['Relationship'] == 'Start <= Start':
-                dependencies[constraint['Second']].add(constraint['First'])
-                dependents[constraint['First']].add(constraint['Second'])
+            relationship = constraint['Relationship']
+            first = constraint['First']
+            second = constraint['Second']
+
+            if relationship == 'Finish <= Finish':
+                # Store F<=F constraints for special handling
+                if second not in finish_finish_constraints:
+                    finish_finish_constraints[second] = []
+                finish_finish_constraints[second].append(first)
+                # Still add as dependency to ensure ordering
+                dependencies[second].add(first)
+                dependents[first].add(second)
+            elif relationship in ['Finish <= Start', 'Finish = Start']:
+                dependencies[second].add(first)
+                dependents[first].add(second)
+            elif relationship == 'Start <= Start':
+                dependencies[second].add(first)
+                dependents[first].add(second)
 
         # Find tasks with no dependencies (can start immediately)
         all_tasks = set(self.tasks.keys())
@@ -1054,29 +1098,67 @@ class ProductionScheduler:
                 if scheduled_count % 50 == 0 and not silent_mode:
                     print(f"[DEBUG]   Late part task, earliest start after on-dock: {late_part_earliest}")
 
+            # Check if any task depends on this as late part
+            for lp_constraint in self.late_part_constraints:
+                if lp_constraint['Second'] == task_id:
+                    late_part_id = lp_constraint['First']
+                    if late_part_id in self.on_dock_dates:
+                        lp_dependent_start = self.apply_late_part_delay_to_dependent(late_part_id, task_id)
+                        if lp_dependent_start:
+                            earliest_start = max(earliest_start, lp_dependent_start)
+
             # Check dependency constraints
             constraint_count = 0
+            latest_finish_time = None  # For F<=F constraints
+
             for dep in dependencies.get(task_id, set()):
                 if dep in self.task_schedule:
                     dep_end = self.task_schedule[dep]['end_time']
+                    dep_start = self.task_schedule[dep]['start_time']
                     constraint_count += 1
 
-                    # Check if this is a Finish = Start relationship
-                    is_finish_equals_start = False
+                    # Find the specific constraint to get the relationship type
+                    constraint_rel = 'Finish <= Start'  # Default
                     for constraint in dynamic_constraints:
-                        if (constraint['First'] == dep and
-                            constraint['Second'] == task_id and
-                            constraint['Relationship'] == 'Finish = Start'):
-                            is_finish_equals_start = True
+                        if constraint['First'] == dep and constraint['Second'] == task_id:
+                            constraint_rel = constraint.get('Relationship', 'Finish <= Start')
                             break
 
-                    if is_finish_equals_start:
+                    if self.debug and scheduled_count % 50 == 0:
+                        print(f"[DEBUG] Task {task_id} depends on {dep} with relationship: {constraint_rel}")
+
+                    # Handle different relationship types
+                    if constraint_rel == 'Finish = Start':
                         earliest_start = dep_end
+                    elif constraint_rel == 'Finish <= Start':
+                        earliest_start = max(earliest_start, dep_end)
+                    elif constraint_rel == 'Start <= Start':
+                        earliest_start = max(earliest_start, dep_start)
+                    elif constraint_rel == 'Finish <= Finish':
+                        # F<=F: Track the latest finish time we must respect
+                        if latest_finish_time is None or dep_end > latest_finish_time:
+                            latest_finish_time = dep_end
                     else:
                         earliest_start = max(earliest_start, dep_end)
 
+            # Handle F<=F constraints - ensure task finishes before or at the same time
+            if task_id in finish_finish_constraints:
+                for predecessor_id in finish_finish_constraints[task_id]:
+                    if predecessor_id in self.task_schedule:
+                        pred_end = self.task_schedule[predecessor_id]['end_time']
+                        # This task must finish after or at the same time as predecessor
+                        # So the earliest this task can finish is pred_end
+                        if latest_finish_time is None or pred_end > latest_finish_time:
+                            latest_finish_time = pred_end
+                        if self.debug:
+                            print(f"[DEBUG] F<=F: {predecessor_id} must finish <= {task_id}")
+                            print(f"[DEBUG]   {predecessor_id} ends at {pred_end}")
+                            print(f"[DEBUG]   {task_id} must end at or after {pred_end}")
+
             if scheduled_count % 50 == 0 and constraint_count > 0 and not silent_mode:
                 print(f"[DEBUG]   Constrained by {constraint_count} dependencies, earliest start: {earliest_start}")
+                if latest_finish_time:
+                    print(f"[DEBUG]   Must finish at or after: {latest_finish_time}")
 
             # Find next available working time with capacity
             if is_quality:
@@ -1122,6 +1204,17 @@ class ProductionScheduler:
 
             # Schedule the task
             scheduled_end = scheduled_start + timedelta(minutes=int(duration))
+
+            # Check F<=F constraint satisfaction
+            if latest_finish_time and scheduled_end < latest_finish_time:
+                # Task would finish too early for F<=F constraint
+                # Adjust start time so task finishes at latest_finish_time
+                adjusted_start = latest_finish_time - timedelta(minutes=int(duration))
+                if adjusted_start > scheduled_start:
+                    if self.debug:
+                        print(f"[DEBUG] Adjusting {task_id} start from {scheduled_start} to {adjusted_start} for F<=F constraint")
+                    scheduled_start = adjusted_start
+                    scheduled_end = latest_finish_time
 
             self.task_schedule[task_id] = {
                 'start_time': scheduled_start,
@@ -1184,6 +1277,94 @@ class ProductionScheduler:
 
         # Restore original debug setting
         self.debug = original_debug
+
+    def debug_task_scheduling(self, task1_id, task2_id):
+        """Debug scheduling relationship between two tasks"""
+        print(f"\n{'='*80}")
+        print(f"DEBUG: Scheduling Analysis for {task1_id} and {task2_id}")
+        print(f"{'='*80}")
+
+        # Check if tasks exist
+        if task1_id not in self.tasks:
+            print(f"ERROR: {task1_id} not found in tasks!")
+            return
+        if task2_id not in self.tasks:
+            print(f"ERROR: {task2_id} not found in tasks!")
+            return
+
+        # Get task info
+        task1_info = self.tasks[task1_id]
+        task2_info = self.tasks[task2_id]
+
+        print(f"\n{task1_id} Details:")
+        print(f"  Team: {task1_info['team']}")
+        print(f"  Duration: {task1_info['duration']} minutes")
+        print(f"  Type: {task1_info['task_type']}")
+
+        print(f"\n{task2_id} Details:")
+        print(f"  Team: {task2_info['team']}")
+        print(f"  Duration: {task2_info['duration']} minutes")
+        print(f"  Type: {task2_info['task_type']}")
+
+        # Check constraints
+        print(f"\n{'='*40}")
+        print("CONSTRAINT ANALYSIS:")
+        print(f"{'='*40}")
+
+        # Check precedence constraints
+        for constraint in self.precedence_constraints:
+            if (constraint['First'] == task1_id and constraint['Second'] == task2_id) or \
+               (constraint['First'] == task2_id and constraint['Second'] == task1_id):
+                print(f"Found Precedence: {constraint['First']} -> {constraint['Second']}")
+                print(f"  Relationship: {constraint['Relationship']}")
+
+        # Check dynamic constraints
+        dynamic_constraints = self.build_dynamic_dependencies()
+        for constraint in dynamic_constraints:
+            if (constraint['First'] == task1_id and constraint['Second'] == task2_id) or \
+               (constraint['First'] == task2_id and constraint['Second'] == task1_id):
+                print(f"Found Dynamic: {constraint['First']} -> {constraint['Second']}")
+                print(f"  Relationship: {constraint['Relationship']}")
+                if 'Type' in constraint:
+                    print(f"  Type: {constraint['Type']}")
+
+        # Check scheduling
+        if task1_id in self.task_schedule and task2_id in self.task_schedule:
+            sched1 = self.task_schedule[task1_id]
+            sched2 = self.task_schedule[task2_id]
+
+            print(f"\n{'='*40}")
+            print("ACTUAL SCHEDULE:")
+            print(f"{'='*40}")
+            print(f"\n{task1_id}:")
+            print(f"  Start: {sched1['start_time']}")
+            print(f"  End: {sched1['end_time']}")
+            print(f"  Team: {sched1['team']}")
+            print(f"  Shift: {sched1['shift']}")
+
+            print(f"\n{task2_id}:")
+            print(f"  Start: {sched2['start_time']}")
+            print(f"  End: {sched2['end_time']}")
+            print(f"  Team: {sched2['team']}")
+            print(f"  Shift: {sched2['shift']}")
+
+            # Check constraint satisfaction
+            print(f"\n{'='*40}")
+            print("CONSTRAINT SATISFACTION CHECK:")
+            print(f"{'='*40}")
+
+            # Check Finish <= Finish relationship
+            if sched1['end_time'] <= sched2['end_time']:
+                print(f"✓ {task1_id} finishes before/at {task2_id}: SATISFIED")
+                print(f"  {task1_id} ends: {sched1['end_time']}")
+                print(f"  {task2_id} ends: {sched2['end_time']}")
+            else:
+                print(f"✗ {task1_id} finishes AFTER {task2_id}: VIOLATED!")
+                print(f"  {task1_id} ends: {sched1['end_time']}")
+                print(f"  {task2_id} ends: {sched2['end_time']}")
+                print(f"  Violation by: {sched1['end_time'] - sched2['end_time']}")
+        else:
+            print("\nWARNING: One or both tasks not yet scheduled")
 
     def validate_dag(self):
         """Validate the DAG for cycles and other issues"""
@@ -1923,9 +2104,7 @@ class ProductionScheduler:
             'quality_capacities': dict(self.quality_team_capacity)
         }
 
-    # ========== SCENARIO 2: Minimize Makespan ==========
-    # Replace the existing scenario_2_minimize_makespan method in scheduler.py with this new version
-
+    # ========== SCENARIO 2: Just-In-Time Optimization ==========
     def scenario_2_just_in_time_optimization(self, min_mechanics=1, max_mechanics=30,
                                              min_quality=1, max_quality=15,
                                              target_lateness=-1, tolerance=2,
@@ -2301,10 +2480,12 @@ class ProductionScheduler:
             'metrics': metrics,
             'target_lateness': target_lateness,
             'max_deviation': best_deviation,
-            'priority_list': priority_list
+            'priority_list': priority_list,
+            'optimal_mechanics': total_mechanics,
+            'optimal_quality': total_quality
         }
 
-    # Add this helper method to test configurations against target
+    # Helper method to test configurations against target
     def _test_configuration_with_target(self, config, target_lateness, tolerance):
         """Test if a configuration meets the target lateness within tolerance"""
         # Apply configuration
